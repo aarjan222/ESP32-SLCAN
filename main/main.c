@@ -4,29 +4,34 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/twai.h"
-#include "driver/uart.h"
 #include "esp_log.h"
+#include "tinyusb.h"
+#include "tusb_cdc_acm.h"
 
 #define TAG "SLCAN"
 
-// CAN pins
+// CAN pins for ESP32
 #define CAN_TX_GPIO 21
 #define CAN_RX_GPIO 22
-
-// USB UART (used for programming)
-#define UART_NUM UART_NUM_0
-#define UART_BUF_SIZE 1024
 
 // SLCAN states
 static bool slcan_opened = false;
 static bool slcan_listen_only = false;
-
-// Queues
-static QueueHandle_t rx_queue;
-static QueueHandle_t tx_queue;
+static bool slcan_timestamp = false;
 
 // Current timing configuration
 static twai_timing_config_t current_timing;
+
+// CDC buffer
+#define CDC_RX_BUF_SIZE 256
+#define CDC_TX_BUF_SIZE 256
+
+static uint8_t cdc_rx_buf[CDC_RX_BUF_SIZE];
+static uint8_t cdc_tx_buf[CDC_TX_BUF_SIZE];
+
+// Command buffer
+static char cmd_buffer[128];
+static int cmd_index = 0;
 
 // Get timing config by bitrate code
 static bool get_timing_config(char code, twai_timing_config_t *config)
@@ -35,7 +40,7 @@ static bool get_timing_config(char code, twai_timing_config_t *config)
 
     switch (code)
     {
-    case '0': // 10 kbit/s - custom config
+    case '0': // 10 kbit/s
         temp_config = (twai_timing_config_t){
             .clk_src = TWAI_CLK_SRC_DEFAULT,
             .quanta_resolution_hz = 1000000,
@@ -45,7 +50,7 @@ static bool get_timing_config(char code, twai_timing_config_t *config)
             .sjw = 16,
             .triple_sampling = false};
         break;
-    case '1': // 20 kbit/s - custom config
+    case '1': // 20 kbit/s
         temp_config = (twai_timing_config_t){
             .clk_src = TWAI_CLK_SRC_DEFAULT,
             .quanta_resolution_hz = 2000000,
@@ -77,6 +82,7 @@ static bool get_timing_config(char code, twai_timing_config_t *config)
         temp_config = (twai_timing_config_t)TWAI_TIMING_CONFIG_1MBITS();
         break;
     default:
+        ESP_LOGW(TAG, "Invalid bitrate code: %c", code);
         return false;
     }
 
@@ -101,16 +107,21 @@ static char byte_to_hex(uint8_t b)
     return b < 10 ? '0' + b : 'A' + b - 10;
 }
 
+// Send response via USB CDC
 static void send_response(const char *resp)
 {
-    uart_write_bytes(UART_NUM, resp, strlen(resp));
+    size_t len = strlen(resp);
+    tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (uint8_t *)resp, len);
+    tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(100));
 }
 
-// Parse SLCAN command and execute
+// Parse and execute SLCAN command
 static void process_slcan_command(const char *cmd, size_t len)
 {
     if (len < 1)
         return;
+
+    ESP_LOGD(TAG, "Command: %c (len=%d)", cmd[0], len);
 
     switch (cmd[0])
     {
@@ -119,84 +130,97 @@ static void process_slcan_command(const char *cmd, size_t len)
         {
             if (get_timing_config(cmd[1], &current_timing))
             {
+                ESP_LOGI(TAG, "Bitrate set to code %c", cmd[1]);
                 send_response("\r");
             }
             else
             {
+                ESP_LOGW(TAG, "Invalid bitrate code");
                 send_response("\x07");
             }
         }
         else
         {
+            ESP_LOGW(TAG, "Cannot set bitrate (open=%d, len=%d)", slcan_opened, len);
             send_response("\x07");
         }
         break;
 
-    case 'O': // Open CAN channel
+    case 'O': // Open CAN channel (normal mode)
         if (!slcan_opened)
         {
-            twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
+            twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+                CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
             twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
-            if (slcan_listen_only)
-            {
-                g_config.mode = TWAI_MODE_LISTEN_ONLY;
-            }
+            g_config.tx_queue_len = 10;
+            g_config.rx_queue_len = 20;
 
             if (twai_driver_install(&g_config, &current_timing, &f_config) == ESP_OK)
             {
                 if (twai_start() == ESP_OK)
                 {
                     slcan_opened = true;
+                    slcan_listen_only = false;
                     send_response("\r");
-                    ESP_LOGI(TAG, "CAN opened");
+                    ESP_LOGI(TAG, "CAN opened (normal mode)");
                 }
                 else
                 {
                     twai_driver_uninstall();
                     send_response("\x07");
+                    ESP_LOGE(TAG, "Failed to start CAN");
                 }
             }
             else
             {
                 send_response("\x07");
+                ESP_LOGE(TAG, "Failed to install CAN driver");
             }
         }
         else
         {
             send_response("\x07");
+            ESP_LOGW(TAG, "CAN already opened");
         }
         break;
 
     case 'L': // Open in listen-only mode
         if (!slcan_opened)
         {
-            slcan_listen_only = true;
-            twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_LISTEN_ONLY);
+            twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+                CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_LISTEN_ONLY);
             twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+            g_config.tx_queue_len = 10;
+            g_config.rx_queue_len = 20;
 
             if (twai_driver_install(&g_config, &current_timing, &f_config) == ESP_OK)
             {
                 if (twai_start() == ESP_OK)
                 {
                     slcan_opened = true;
+                    slcan_listen_only = true;
                     send_response("\r");
-                    ESP_LOGI(TAG, "CAN opened (listen-only)");
+                    ESP_LOGI(TAG, "CAN opened (listen-only mode)");
                 }
                 else
                 {
                     twai_driver_uninstall();
                     send_response("\x07");
+                    ESP_LOGE(TAG, "Failed to start CAN (listen-only)");
                 }
             }
             else
             {
                 send_response("\x07");
+                ESP_LOGE(TAG, "Failed to install CAN driver (listen-only)");
             }
         }
         else
         {
             send_response("\x07");
+            ESP_LOGW(TAG, "CAN already opened");
         }
         break;
 
@@ -212,7 +236,8 @@ static void process_slcan_command(const char *cmd, size_t len)
         }
         else
         {
-            send_response("\x07");
+            send_response("\r"); // Some tools expect success even if already closed
+            ESP_LOGD(TAG, "CAN already closed");
         }
         break;
 
@@ -229,6 +254,7 @@ static void process_slcan_command(const char *cmd, size_t len)
             int id_len = (cmd[0] == 't' || cmd[0] == 'r') ? 3 : 8;
             if (len < idx + id_len + 1)
             {
+                ESP_LOGW(TAG, "TX: Invalid length");
                 send_response("\x07");
                 break;
             }
@@ -245,21 +271,24 @@ static void process_slcan_command(const char *cmd, size_t len)
             // Parse DLC
             if (idx >= len)
             {
+                ESP_LOGW(TAG, "TX: Missing DLC");
                 send_response("\x07");
                 break;
             }
             msg.data_length_code = hex_to_byte(cmd[idx++]);
             if (msg.data_length_code > 8)
             {
+                ESP_LOGW(TAG, "TX: Invalid DLC %d", msg.data_length_code);
                 send_response("\x07");
                 break;
             }
 
-            // Parse data
+            // Parse data (if not RTR)
             if (!msg.rtr)
             {
                 if (len < idx + msg.data_length_code * 2)
                 {
+                    ESP_LOGW(TAG, "TX: Incomplete data");
                     send_response("\x07");
                     break;
                 }
@@ -271,14 +300,30 @@ static void process_slcan_command(const char *cmd, size_t len)
             }
 
             // Transmit
-            if (twai_transmit(&msg, pdMS_TO_TICKS(100)) == ESP_OK)
+            if (twai_transmit(&msg, pdMS_TO_TICKS(1000)) == ESP_OK)
             {
-                send_response("z\r");
+                send_response("z\r"); // Success
+                ESP_LOGD(TAG, "TX: ID=0x%03X DLC=%d", msg.identifier, msg.data_length_code);
             }
             else
             {
-                send_response("\x07");
+                send_response("\x07"); // Error
+                ESP_LOGW(TAG, "TX failed");
             }
+        }
+        else
+        {
+            ESP_LOGW(TAG, "TX: CAN not open or listen-only");
+            send_response("\x07");
+        }
+        break;
+
+    case 'Z': // Enable timestamps
+        if (len >= 2)
+        {
+            slcan_timestamp = (cmd[1] == '1');
+            send_response("\r");
+            ESP_LOGI(TAG, "Timestamps %s", slcan_timestamp ? "enabled" : "disabled");
         }
         else
         {
@@ -286,11 +331,11 @@ static void process_slcan_command(const char *cmd, size_t len)
         }
         break;
 
-    case 'V': // Get version
+    case 'V': // Get hardware version
         send_response("V1234\r");
         break;
 
-    case 'v': // Get minor version
+    case 'v': // Get firmware version
         send_response("v0100\r");
         break;
 
@@ -298,21 +343,36 @@ static void process_slcan_command(const char *cmd, size_t len)
         send_response("NESP32\r");
         break;
 
-    case 'F': // Status flags
-        send_response("F00\r");
+    case 'F': // Read status flags
+        send_response("F00\r"); // No errors
+        break;
+
+    case 'W': // Filter mode (not implemented)
+        send_response("\r");
+        break;
+
+    case 'M': // Acceptance code (not implemented)
+        send_response("\r");
+        break;
+
+    case 'm': // Acceptance mask (not implemented)
+        send_response("\r");
         break;
 
     default:
+        ESP_LOGW(TAG, "Unknown command: %c", cmd[0]);
         send_response("\x07");
         break;
     }
 }
 
-// Task to receive CAN messages and send to UART
+// Task to receive CAN messages and send to USB CDC
 static void can_rx_task(void *arg)
 {
     twai_message_t msg;
     char buf[64];
+
+    ESP_LOGI(TAG, "CAN RX task started");
 
     while (1)
     {
@@ -342,7 +402,7 @@ static void can_rx_task(void *arg)
                 // DLC
                 buf[idx++] = byte_to_hex(msg.data_length_code);
 
-                // Data
+                // Data (if not RTR)
                 if (!msg.rtr)
                 {
                     for (int i = 0; i < msg.data_length_code; i++)
@@ -352,11 +412,25 @@ static void can_rx_task(void *arg)
                     }
                 }
 
+                // Timestamp (if enabled)
+                if (slcan_timestamp)
+                {
+                    uint32_t timestamp = xTaskGetTickCount();
+                    buf[idx++] = byte_to_hex((timestamp >> 12) & 0xF);
+                    buf[idx++] = byte_to_hex((timestamp >> 8) & 0xF);
+                    buf[idx++] = byte_to_hex((timestamp >> 4) & 0xF);
+                    buf[idx++] = byte_to_hex(timestamp & 0xF);
+                }
+
                 // Terminator
                 buf[idx++] = '\r';
                 buf[idx] = '\0';
 
-                uart_write_bytes(UART_NUM, buf, idx);
+                // Send via USB CDC
+                tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (uint8_t *)buf, idx);
+                tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
+
+                ESP_LOGD(TAG, "RX: %s", buf);
             }
         }
         else
@@ -366,68 +440,93 @@ static void can_rx_task(void *arg)
     }
 }
 
-// Task to receive UART commands
-static void uart_rx_task(void *arg)
+// USB CDC RX callback
+void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event)
 {
-    uint8_t data[128];
-    static char cmd_buf[128];
-    static int cmd_idx = 0;
+    size_t rx_size = 0;
 
-    while (1)
+    esp_err_t ret = tinyusb_cdcacm_read(itf, cdc_rx_buf, CDC_RX_BUF_SIZE, &rx_size);
+    if (ret == ESP_OK)
     {
-        int len = uart_read_bytes(UART_NUM, data, sizeof(data), pdMS_TO_TICKS(20));
-
-        for (int i = 0; i < len; i++)
+        for (size_t i = 0; i < rx_size; i++)
         {
-            if (data[i] == '\r' || data[i] == '\n')
+            char c = cdc_rx_buf[i];
+
+            if (c == '\r' || c == '\n')
             {
-                if (cmd_idx > 0)
+                if (cmd_index > 0)
                 {
-                    cmd_buf[cmd_idx] = '\0';
-                    process_slcan_command(cmd_buf, cmd_idx);
-                    cmd_idx = 0;
+                    cmd_buffer[cmd_index] = '\0';
+                    process_slcan_command(cmd_buffer, cmd_index);
+                    cmd_index = 0;
                 }
             }
-            else if (cmd_idx < sizeof(cmd_buf) - 1)
+            else if (cmd_index < sizeof(cmd_buffer) - 1)
             {
-                cmd_buf[cmd_idx++] = data[i];
+                cmd_buffer[cmd_index++] = c;
             }
             else
             {
-                // Buffer overflow
-                cmd_idx = 0;
+                // Buffer overflow - reset
+                cmd_index = 0;
                 send_response("\x07");
+                ESP_LOGW(TAG, "Command buffer overflow");
             }
         }
     }
 }
 
+// USB CDC line state callback
+void tinyusb_cdc_line_state_changed_callback(int itf, cdcacm_event_t *event)
+{
+    int dtr = event->line_state_changed_data.dtr;
+    int rts = event->line_state_changed_data.rts;
+    ESP_LOGI(TAG, "Line state changed: DTR=%d RTS=%d", dtr, rts);
+}
+
 void app_main(void)
 {
-    ESP_LOGI(TAG, "SLCAN Device Starting...");
+    ESP_LOGI(TAG, "=== ESP32 SLCAN Adapter ===");
+    ESP_LOGI(TAG, "CAN TX: GPIO%d, RX: GPIO%d", CAN_TX_GPIO, CAN_RX_GPIO);
 
     // Initialize with default 500kbit/s timing
     current_timing = (twai_timing_config_t)TWAI_TIMING_CONFIG_500KBITS();
 
-    // Configure UART
-    uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    // Configure USB CDC
+    ESP_LOGI(TAG, "Initializing USB CDC...");
+
+    tinyusb_config_t tusb_cfg = {
+        .device_descriptor = NULL, // Use default
+        .string_descriptor = NULL,
+        .external_phy = false,
+        .configuration_descriptor = NULL,
     };
 
-    uart_param_config(UART_NUM, &uart_config);
-    uart_driver_install(UART_NUM, UART_BUF_SIZE * 2, UART_BUF_SIZE * 2, 0, NULL, 0);
+    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
 
-    ESP_LOGI(TAG, "UART configured at 115200 baud");
-    ESP_LOGI(TAG, "CAN TX: GPIO%d, RX: GPIO%d", CAN_TX_GPIO, CAN_RX_GPIO);
+    tinyusb_config_cdcacm_t acm_cfg = {
+        .usb_dev = TINYUSB_USBDEV_0,
+        .cdc_port = TINYUSB_CDC_ACM_0,
+        .rx_unread_buf_sz = 256,
+        .callback_rx = &tinyusb_cdc_rx_callback,
+        .callback_rx_wanted_char = NULL,
+        .callback_line_state_changed = &tinyusb_cdc_line_state_changed_callback,
+        .callback_line_coding_changed = NULL,
+    };
 
-    // Create tasks
-    xTaskCreate(uart_rx_task, "uart_rx", 4096, NULL, 10, NULL);
-    xTaskCreate(can_rx_task, "can_rx", 4096, NULL, 9, NULL);
+    ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
+
+    ESP_LOGI(TAG, "USB CDC configured");
+
+    // Create CAN RX task
+    xTaskCreate(can_rx_task, "can_rx", 4096, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "SLCAN ready!");
-    send_response("\r\nSLCAN Ready\r\n");
+
+    // Wait for USB enumeration
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // Send ready message
+    send_response("\r\nSLCAN ESP32 Ready\r\n");
+    send_response("Use 'candump' or 'cansend' tools\r\n");
 }
