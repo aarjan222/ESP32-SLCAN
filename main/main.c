@@ -11,8 +11,8 @@
 #define TAG "SLCAN"
 
 // CAN pins for ESP32
-#define CAN_TX_GPIO 21
-#define CAN_RX_GPIO 22
+#define CAN_TX_GPIO 47
+#define CAN_RX_GPIO 21
 
 // SLCAN states
 static bool slcan_opened = false;
@@ -490,7 +490,7 @@ void app_main(void)
     ESP_LOGI(TAG, "CAN TX: GPIO%d, RX: GPIO%d", CAN_TX_GPIO, CAN_RX_GPIO);
 
     // Initialize with default 500kbit/s timing
-    current_timing = (twai_timing_config_t)TWAI_TIMING_CONFIG_500KBITS();
+    current_timing = (twai_timing_config_t)TWAI_TIMING_CONFIG_250KBITS();
 
     // Configure USB CDC
     ESP_LOGI(TAG, "Initializing USB CDC...");
