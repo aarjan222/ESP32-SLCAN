@@ -154,6 +154,7 @@ static bool can_open_locked(twai_mode_t mode)
 // wait for it to acknowledge, THEN tear down the driver.
 static void can_close_safe(void)
 {
+    ESP_LOGE(TAG, "safe can close requested");
     // 1. Signal the RX task to stop calling twai_receive
     twai_stop_req = true;
 
@@ -396,6 +397,59 @@ static void can_rx_task(void *arg)
 
         // Short timeout so we can respond quickly to twai_stop_req
         esp_err_t ret = twai_receive(&msg, pdMS_TO_TICKS(50));
+        if (ret == ESP_OK)
+        {
+            // ESP_LOGI(TAG, "twai_receive ok");
+            // Format SLCAN frame
+            int idx = 0;
+
+            if (msg.extd)
+                buf[idx++] = msg.rtr ? 'R' : 'T';
+            else
+                buf[idx++] = msg.rtr ? 'r' : 't';
+
+            int id_len = msg.extd ? 8 : 3;
+            for (int i = id_len - 1; i >= 0; i--)
+                buf[idx++] = byte_to_hex((msg.identifier >> (i * 4)) & 0xF);
+
+            buf[idx++] = byte_to_hex(msg.data_length_code);
+
+            if (!msg.rtr)
+            {
+                for (int i = 0; i < msg.data_length_code; i++)
+                {
+                    buf[idx++] = byte_to_hex((msg.data[i] >> 4) & 0xF);
+                    buf[idx++] = byte_to_hex(msg.data[i] & 0xF);
+                }
+            }
+
+            // Timestamp: 4 hex nibbles, milliseconds wrapping at 0xFFFF (SLCAN spec)
+            if (slcan_timestamp)
+            {
+                uint32_t ts = (xTaskGetTickCount() * portTICK_PERIOD_MS) & 0xFFFF;
+                buf[idx++] = byte_to_hex((ts >> 12) & 0xF);
+                buf[idx++] = byte_to_hex((ts >> 8) & 0xF);
+                buf[idx++] = byte_to_hex((ts >> 4) & 0xF);
+                buf[idx++] = byte_to_hex(ts & 0xF);
+            }
+
+            buf[idx++] = '\r';
+
+            // tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (uint8_t *)buf, idx);
+            // tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
+            if (usb_ready && idx > 0)
+            {
+                tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (uint8_t *)buf, idx);
+                if (tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 100) != ESP_OK)
+                {
+                    ESP_LOGW(TAG, "USB flush failed, skipping frame");
+                }
+            }
+            else
+            {
+                ESP_LOGW(TAG, "USB not ready or no data to send");
+            }
+        }
 
         // If a close was requested, signal that we are out of twai_receive
         if (twai_stop_req)
@@ -410,45 +464,9 @@ static void can_rx_task(void *arg)
         }
 
         if (ret != ESP_OK)
+        {
             continue; // timeout or error, loop
-
-        // Format SLCAN frame
-        int idx = 0;
-
-        if (msg.extd)
-            buf[idx++] = msg.rtr ? 'R' : 'T';
-        else
-            buf[idx++] = msg.rtr ? 'r' : 't';
-
-        int id_len = msg.extd ? 8 : 3;
-        for (int i = id_len - 1; i >= 0; i--)
-            buf[idx++] = byte_to_hex((msg.identifier >> (i * 4)) & 0xF);
-
-        buf[idx++] = byte_to_hex(msg.data_length_code);
-
-        if (!msg.rtr)
-        {
-            for (int i = 0; i < msg.data_length_code; i++)
-            {
-                buf[idx++] = byte_to_hex((msg.data[i] >> 4) & 0xF);
-                buf[idx++] = byte_to_hex(msg.data[i] & 0xF);
-            }
         }
-
-        // Timestamp: 4 hex nibbles, milliseconds wrapping at 0xFFFF (SLCAN spec)
-        if (slcan_timestamp)
-        {
-            uint32_t ts = (xTaskGetTickCount() * portTICK_PERIOD_MS) & 0xFFFF;
-            buf[idx++] = byte_to_hex((ts >> 12) & 0xF);
-            buf[idx++] = byte_to_hex((ts >> 8) & 0xF);
-            buf[idx++] = byte_to_hex((ts >> 4) & 0xF);
-            buf[idx++] = byte_to_hex(ts & 0xF);
-        }
-
-        buf[idx++] = '\r';
-
-        tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (uint8_t *)buf, idx);
-        tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
     }
 }
 

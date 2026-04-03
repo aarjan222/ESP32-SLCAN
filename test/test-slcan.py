@@ -1,14 +1,12 @@
 import can
 import threading
+import serial
 
-from can.interfaces.slcan import slcanBus
-
-bus = slcanBus(
-    channel="/dev/ttyACM4",
-    bitrate=250000,
-    sleep_after_open=2,
-    rtscts=False,
-    listen_only=False,
+# Use unified interface API
+bus = can.interface.Bus(
+    channel="/dev/ttyACM5",
+    interface="slcan",
+    bitrate=250000
 )
 
 
@@ -18,6 +16,7 @@ def keyboard_listener():
 
         if user_input == "1":
             print("sending message")
+
             tx_msg = can.Message(
                 arbitration_id=0x0816FAFC,
                 data=[0x01, 0x01, 0x40, 0x02, 0x00, 0x00, 0x00, 0x00],
@@ -38,7 +37,6 @@ print("Listening on CAN bus... Press 1 + Enter to send\n")
 
 try:
     while True:
-        print("start receving")
         msg = bus.recv(timeout=1)
         if msg:
             print("RX:", msg)
